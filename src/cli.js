@@ -23,6 +23,7 @@ async function startIntercept({ proxyPort, uiPort, open: autoOpen }) {
       return;
     } catch {
       fs.unlinkSync(PID_FILE); // stale pid file
+      healStaleSystemProxy();  // a prior crash may have orphaned the system proxy
     }
   }
 
@@ -74,6 +75,7 @@ async function startIntercept({ proxyPort, uiPort, open: autoOpen }) {
   // Graceful shutdown
   process.on('SIGINT', () => shutdown(proxy));
   process.on('SIGTERM', () => shutdown(proxy));
+  process.on('SIGHUP', () => shutdown(proxy)); // closed terminal must still restore the proxy
 }
 
 function shutdown(proxy) {
@@ -89,6 +91,37 @@ function shutdown(proxy) {
   } catch {}
   if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
   process.exit(0);
+}
+
+// Detect-and-heal: an ungraceful exit (SIGKILL, OOM-kill, power loss, closed
+// terminal) can't run shutdown(), leaving the system proxy pointed at a now
+// dead intercept — which breaks all network access for the user. Every CLI
+// entrypoint that observes a *stale PID file* (proof intercept owned the
+// proxy and exited dirty) calls this to restore the network. Gated on that
+// evidence so an unrelated user-configured local proxy is never reverted.
+function healStaleSystemProxy() {
+  let sysProxy;
+  try {
+    sysProxy = require('./system_proxy');
+  } catch {
+    return false;
+  }
+  let st;
+  try {
+    st = sysProxy.status();
+  } catch {
+    return false;
+  }
+  if (!sysProxy.staleProxyNeedsRevert(false, st)) return false;
+  try {
+    sysProxy.disable();
+    console.log(chalk.green('  ✓ Recovered: a stale system proxy from a previous intercept run was reverted.'));
+    return true;
+  } catch (err) {
+    console.log(chalk.yellow(`  ! Stale system proxy detected but auto-revert failed: ${err.message}`));
+    console.log(chalk.yellow('    Run:  claude-intercept proxy off'));
+    return false;
+  }
 }
 
 // Safety net: restore proxy on uncaught errors so network isn't left broken
@@ -136,13 +169,17 @@ program
       return;
     }
     const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
-    try {
-      process.kill(pid, 'SIGTERM');
-      fs.unlinkSync(PID_FILE);
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch {}
+    if (alive) {
+      try { process.kill(pid, 'SIGTERM'); } catch {}
+      if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
       console.log(chalk.green(`  Stopped (PID ${pid})`));
-    } catch {
-      console.log(chalk.yellow('  Process not found, clearing PID file.'));
-      fs.unlinkSync(PID_FILE);
+      // The signalled process restores the system proxy in its own shutdown handler.
+    } else {
+      if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
+      console.log(chalk.yellow('  Process not found, clearing stale PID file.'));
+      healStaleSystemProxy(); // its shutdown handler never ran — restore the network now
     }
   });
 
@@ -166,7 +203,8 @@ program
       } catch {}
     } catch {
       console.log(chalk.red('  ✗ Stale PID file — process not found'));
-      fs.unlinkSync(PID_FILE);
+      if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
+      healStaleSystemProxy(); // dead intercept may still own the system proxy
     }
   });
 

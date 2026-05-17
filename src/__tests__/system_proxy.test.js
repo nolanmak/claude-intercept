@@ -6,6 +6,7 @@ const {
   linuxEnvLines,
   parseGsettingsValue,
   linuxStatusFromValues,
+  staleProxyNeedsRevert,
   kdeProxyConfigOps,
   binExists,
 } = require('../system_proxy');
@@ -114,6 +115,33 @@ test('linuxStatusFromValues — string port is coerced', () => {
   });
   assert.strictEqual(s.port, 7777);
   assert.strictEqual(s.pointsHere, true);
+});
+
+test('staleProxyNeedsRevert — live process is never reverted, even if pointed here', () => {
+  const st = { services: [{ pointsHere: true }] };
+  assert.strictEqual(staleProxyNeedsRevert(true, st), false);
+});
+
+test('staleProxyNeedsRevert — dead process + a service pointing here → revert', () => {
+  const st = { services: [{ pointsHere: false }, { pointsHere: true }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st), true);
+});
+
+test('staleProxyNeedsRevert — dead process but nothing points here → no revert', () => {
+  const st = { services: [{ pointsHere: false }, { pointsHere: false }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st), false);
+});
+
+test('staleProxyNeedsRevert — defensive against missing/empty status', () => {
+  assert.strictEqual(staleProxyNeedsRevert(false, undefined), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, {}), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [] }), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [null, undefined] }), false);
+});
+
+test('staleProxyNeedsRevert — only an exact pointsHere===true triggers a revert', () => {
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [{ pointsHere: 1 }] }), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [{ pointsHere: 'yes' }] }), false);
 });
 
 test('kdeProxyConfigOps returns the expected arg vectors', () => {

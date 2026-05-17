@@ -197,6 +197,18 @@ function linuxStatusFromValues({ mode, httpHost, httpPort, httpsHost, service = 
   };
 }
 
+// Pure: decide whether a *dead* intercept left the system proxy pointed at
+// itself. True only when the proxy process is gone AND a service still routes
+// here — the signature of an ungraceful exit (SIGKILL, OOM, power loss, closed
+// terminal) that skipped the SIGINT/SIGTERM cleanup. Callers must additionally
+// gate on stale-PID evidence so an unrelated user-configured local proxy is
+// never reverted.
+function staleProxyNeedsRevert(processAlive, statusResult) {
+  if (processAlive) return false;
+  const services = (statusResult && statusResult.services) || [];
+  return services.some((s) => s && s.pointsHere === true);
+}
+
 // Detect the desktop environment. 'gnome' if the gsettings proxy schema
 // resolves, 'kde' if kwriteconfig{6,5} is present or XDG_CURRENT_DESKTOP looks
 // like KDE, else null.
@@ -473,6 +485,7 @@ module.exports = {
   linuxEnvLines,
   parseGsettingsValue,
   linuxStatusFromValues,
+  staleProxyNeedsRevert,
   kdeProxyConfigOps,
   binExists,
 };
