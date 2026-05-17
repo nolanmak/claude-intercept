@@ -14,16 +14,17 @@ const PID_FILE = path.join(PROJECT_ROOT, 'captures', 'intercept.pid');
 async function startIntercept({ proxyPort, uiPort, open: autoOpen }) {
   // Check if already running
   if (fs.existsSync(PID_FILE)) {
+    const rec = readPidFile();
     try {
-      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
-      process.kill(pid, 0);
-      console.log(chalk.yellow(`[intercept] Already running (PID ${pid})`));
+      if (!rec) throw new Error('unreadable pid file');
+      process.kill(rec.pid, 0);
+      console.log(chalk.yellow(`[intercept] Already running (PID ${rec.pid})`));
       console.log(chalk.cyan(`  Proxy: http://127.0.0.1:${proxyPort}`));
       console.log(chalk.cyan(`  Dashboard: http://127.0.0.1:${uiPort}`));
       return;
     } catch {
-      fs.unlinkSync(PID_FILE); // stale pid file
-      healStaleSystemProxy();  // a prior crash may have orphaned the system proxy
+      if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} } // stale pid file
+      healStaleSystemProxy(rec && rec.proxyPort); // a prior crash may have orphaned the system proxy
     }
   }
 
@@ -51,9 +52,9 @@ async function startIntercept({ proxyPort, uiPort, open: autoOpen }) {
   await listenUI();
   await proxy.listen();
 
-  // Write PID
-  fs.mkdirSync(path.dirname(PID_FILE), { recursive: true });
-  fs.writeFileSync(PID_FILE, String(process.pid));
+  // Write PID + the port we bound, so a later stale-PID heal can match the
+  // *exact* proxy and never clobber an unrelated local proxy on another port.
+  writePidFile(proxyPort);
 
   const localIp = getLocalIP();
 
@@ -93,13 +94,41 @@ function shutdown(proxy) {
   process.exit(0);
 }
 
+// Read the PID file as a tolerant { pid, proxyPort } record (or null).
+// Parsing lives in system_proxy.parsePidFile so it can be unit-tested;
+// this just does the IO.
+function readPidFile() {
+  let raw;
+  try {
+    raw = fs.readFileSync(PID_FILE, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    return require('./system_proxy').parsePidFile(raw);
+  } catch {
+    return null;
+  }
+}
+
+// Persist the PID and the proxy port we bound, as JSON.
+function writePidFile(proxyPort) {
+  fs.mkdirSync(path.dirname(PID_FILE), { recursive: true });
+  fs.writeFileSync(
+    PID_FILE,
+    JSON.stringify({ pid: process.pid, proxyPort: proxyPort ?? null })
+  );
+}
+
 // Detect-and-heal: an ungraceful exit (SIGKILL, OOM-kill, power loss, closed
 // terminal) can't run shutdown(), leaving the system proxy pointed at a now
 // dead intercept — which breaks all network access for the user. Every CLI
 // entrypoint that observes a *stale PID file* (proof intercept owned the
 // proxy and exited dirty) calls this to restore the network. Gated on that
 // evidence so an unrelated user-configured local proxy is never reverted.
-function healStaleSystemProxy() {
+// `expectedPort` (from the stale PID file, when present) further restricts
+// the revert to the *exact* 127.0.0.1:port intercept used.
+function healStaleSystemProxy(expectedPort) {
   let sysProxy;
   try {
     sysProxy = require('./system_proxy');
@@ -112,7 +141,7 @@ function healStaleSystemProxy() {
   } catch {
     return false;
   }
-  if (!sysProxy.staleProxyNeedsRevert(false, st)) return false;
+  if (!sysProxy.staleProxyNeedsRevert(false, st, expectedPort)) return false;
   try {
     sysProxy.disable();
     console.log(chalk.green('  ✓ Recovered: a stale system proxy from a previous intercept run was reverted.'));
@@ -168,18 +197,18 @@ program
       console.log(chalk.yellow('  No running instance found.'));
       return;
     }
-    const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+    const rec = readPidFile();
     let alive = false;
-    try { process.kill(pid, 0); alive = true; } catch {}
+    if (rec) { try { process.kill(rec.pid, 0); alive = true; } catch {} }
     if (alive) {
-      try { process.kill(pid, 'SIGTERM'); } catch {}
+      try { process.kill(rec.pid, 'SIGTERM'); } catch {}
       if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
-      console.log(chalk.green(`  Stopped (PID ${pid})`));
+      console.log(chalk.green(`  Stopped (PID ${rec.pid})`));
       // The signalled process restores the system proxy in its own shutdown handler.
     } else {
       if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
       console.log(chalk.yellow('  Process not found, clearing stale PID file.'));
-      healStaleSystemProxy(); // its shutdown handler never ran — restore the network now
+      healStaleSystemProxy(rec && rec.proxyPort); // its shutdown handler never ran — restore the network now
     }
   });
 
@@ -191,20 +220,21 @@ program
       console.log(chalk.red('  ✗ Not running'));
       return;
     }
-    const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
-    try {
-      process.kill(pid, 0);
-      console.log(chalk.green(`  ✓ Running (PID ${pid})`));
+    const rec = readPidFile();
+    let alive = false;
+    if (rec) { try { process.kill(rec.pid, 0); alive = true; } catch {} }
+    if (alive) {
+      console.log(chalk.green(`  ✓ Running (PID ${rec.pid})`));
       try {
         const db = require('./storage/db');
         db.init();
         const stats = db.getStats();
         console.log(`    Captures: ${stats.total}  |  Hosts: ${stats.hosts}`);
       } catch {}
-    } catch {
+    } else {
       console.log(chalk.red('  ✗ Stale PID file — process not found'));
       if (fs.existsSync(PID_FILE)) { try { fs.unlinkSync(PID_FILE); } catch {} }
-      healStaleSystemProxy(); // dead intercept may still own the system proxy
+      healStaleSystemProxy(rec && rec.proxyPort); // dead intercept may still own the system proxy
     }
   });
 

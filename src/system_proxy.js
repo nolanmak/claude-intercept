@@ -197,16 +197,52 @@ function linuxStatusFromValues({ mode, httpHost, httpPort, httpsHost, service = 
   };
 }
 
+// Pure: parse the PID file. Current format is JSON `{ pid, proxyPort }`;
+// older versions wrote a bare PID. Tolerant by design — an old-format file
+// left on disk is exactly the kind of stale leftover this feature heals.
+// Returns `{ pid, proxyPort }` (proxyPort null when unknown) or null.
+function parsePidFile(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (s === '') return null;
+  const toPort = (v) => {
+    if (Number.isInteger(v)) return v;
+    const n = parseInt(v, 10);
+    return Number.isInteger(n) ? n : null;
+  };
+  let o;
+  try {
+    o = JSON.parse(s);
+  } catch {
+    o = null; // not JSON
+  }
+  if (o && typeof o === 'object') {
+    const pid = parseInt(o.pid, 10);
+    if (!Number.isInteger(pid)) return null;
+    return { pid, proxyPort: toPort(o.proxyPort) };
+  }
+  // Legacy bare PID, or JSON that parsed to a primitive (a bare integer is
+  // itself valid JSON, so this also covers the old `String(pid)` format).
+  const pid = parseInt(s, 10);
+  return Number.isInteger(pid) ? { pid, proxyPort: null } : null;
+}
+
 // Pure: decide whether a *dead* intercept left the system proxy pointed at
 // itself. True only when the proxy process is gone AND a service still routes
 // here — the signature of an ungraceful exit (SIGKILL, OOM, power loss, closed
 // terminal) that skipped the SIGINT/SIGTERM cleanup. Callers must additionally
 // gate on stale-PID evidence so an unrelated user-configured local proxy is
-// never reverted.
-function staleProxyNeedsRevert(processAlive, statusResult) {
+// never reverted. When `expectedPort` is a known integer (persisted by a
+// newer PID file), require an exact host+port match so a *different* local
+// proxy the user runs on another port is never clobbered; when it is
+// null/unknown (legacy PID file) fall back to host-only — still stale-PID
+// gated, so behavior is unchanged for old files.
+function staleProxyNeedsRevert(processAlive, statusResult, expectedPort) {
   if (processAlive) return false;
   const services = (statusResult && statusResult.services) || [];
-  return services.some((s) => s && s.pointsHere === true);
+  const port = Number.isInteger(expectedPort) ? expectedPort : null;
+  return services.some(
+    (s) => s && s.pointsHere === true && (port == null || s.port === port)
+  );
 }
 
 // Detect the desktop environment. 'gnome' if the gsettings proxy schema
@@ -485,6 +521,7 @@ module.exports = {
   linuxEnvLines,
   parseGsettingsValue,
   linuxStatusFromValues,
+  parsePidFile,
   staleProxyNeedsRevert,
   kdeProxyConfigOps,
   binExists,
