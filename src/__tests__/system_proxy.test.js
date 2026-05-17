@@ -6,6 +6,8 @@ const {
   linuxEnvLines,
   parseGsettingsValue,
   linuxStatusFromValues,
+  parsePidFile,
+  staleProxyNeedsRevert,
   kdeProxyConfigOps,
   binExists,
 } = require('../system_proxy');
@@ -114,6 +116,97 @@ test('linuxStatusFromValues — string port is coerced', () => {
   });
   assert.strictEqual(s.port, 7777);
   assert.strictEqual(s.pointsHere, true);
+});
+
+test('staleProxyNeedsRevert — live process is never reverted, even if pointed here', () => {
+  const st = { services: [{ pointsHere: true }] };
+  assert.strictEqual(staleProxyNeedsRevert(true, st), false);
+});
+
+test('staleProxyNeedsRevert — dead process + a service pointing here → revert', () => {
+  const st = { services: [{ pointsHere: false }, { pointsHere: true }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st), true);
+});
+
+test('staleProxyNeedsRevert — dead process but nothing points here → no revert', () => {
+  const st = { services: [{ pointsHere: false }, { pointsHere: false }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st), false);
+});
+
+test('staleProxyNeedsRevert — defensive against missing/empty status', () => {
+  assert.strictEqual(staleProxyNeedsRevert(false, undefined), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, {}), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [] }), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [null, undefined] }), false);
+});
+
+test('staleProxyNeedsRevert — only an exact pointsHere===true triggers a revert', () => {
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [{ pointsHere: 1 }] }), false);
+  assert.strictEqual(staleProxyNeedsRevert(false, { services: [{ pointsHere: 'yes' }] }), false);
+});
+
+test('parsePidFile — JSON with pid + proxyPort', () => {
+  assert.deepStrictEqual(parsePidFile('{"pid":12345,"proxyPort":7777}'), {
+    pid: 12345,
+    proxyPort: 7777,
+  });
+});
+
+test('parsePidFile — JSON with pid only → proxyPort null', () => {
+  assert.deepStrictEqual(parsePidFile('{"pid":42}'), { pid: 42, proxyPort: null });
+});
+
+test('parsePidFile — numeric-string proxyPort is coerced', () => {
+  assert.deepStrictEqual(parsePidFile('{"pid":42,"proxyPort":"9090"}'), {
+    pid: 42,
+    proxyPort: 9090,
+  });
+});
+
+test('parsePidFile — legacy bare PID (pre-port format) still parses', () => {
+  assert.deepStrictEqual(parsePidFile('12345'), { pid: 12345, proxyPort: null });
+  assert.deepStrictEqual(parsePidFile('  12345\n'), { pid: 12345, proxyPort: null });
+});
+
+test('parsePidFile — empty / whitespace / garbage / bad pid → null', () => {
+  assert.strictEqual(parsePidFile(''), null);
+  assert.strictEqual(parsePidFile('   \n'), null);
+  assert.strictEqual(parsePidFile(undefined), null);
+  assert.strictEqual(parsePidFile('not-a-pid'), null);
+  assert.strictEqual(parsePidFile('{"pid":"nope"}'), null);
+  assert.strictEqual(parsePidFile('{"proxyPort":7777}'), null);
+});
+
+test('staleProxyNeedsRevert — known port that matches → revert', () => {
+  const st = { services: [{ pointsHere: true, port: 7777 }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st, 7777), true);
+});
+
+test('staleProxyNeedsRevert — pointsHere but DIFFERENT port → no revert', () => {
+  // The user's-other-local-proxy case: intercept ran on 7777, user has an
+  // unrelated proxy on 9999. Must not be clobbered.
+  const st = { services: [{ pointsHere: true, port: 9999 }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st, 7777), false);
+});
+
+test('staleProxyNeedsRevert — unknown/legacy port (null) falls back to host-only', () => {
+  const st = { services: [{ pointsHere: true, port: 9999 }] };
+  assert.strictEqual(staleProxyNeedsRevert(false, st, null), true);
+  assert.strictEqual(staleProxyNeedsRevert(false, st, undefined), true);
+  // Non-integer expectedPort is treated as unknown, not as a failed match.
+  assert.strictEqual(staleProxyNeedsRevert(false, st, '7777'), true);
+});
+
+test('staleProxyNeedsRevert — matching port among multiple services', () => {
+  const st = {
+    services: [
+      { pointsHere: false, port: 7777 },
+      { pointsHere: true, port: 8080 },
+      { pointsHere: true, port: 7777 },
+    ],
+  };
+  assert.strictEqual(staleProxyNeedsRevert(false, st, 7777), true);
+  assert.strictEqual(staleProxyNeedsRevert(false, st, 3128), false);
 });
 
 test('kdeProxyConfigOps returns the expected arg vectors', () => {
